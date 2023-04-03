@@ -1,1 +1,215 @@
+from typing import Optional, List
+from fastapi import FastAPI, Depends, HTTPException, Header, status
+from fastapi.security import HTTPBearer, OAuth2PasswordBearer, OAuth2PasswordRequestForm, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from pydantic import BaseModel
+from sqlalchemy import create_engine,DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import Column, Integer, String, Boolean
+from jwt import decode, exceptions, PyJWTError
+from sqlalchemy.sql import func
 
+# database------------------------------------------------------------------------------------------------------------------------------------------
+SQL_DATABASE_URL = "postgresql://postgres:milan@localhost:5432/fast_db"
+
+engine = create_engine(SQL_DATABASE_URL)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()
+
+security = HTTPBearer()
+
+class User(Base):
+    __tablename__ = "user"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    email= Column(String, unique=True)
+    password_hash = Column(String)
+    is_active= Column(Boolean, default=True)
+
+class Token(Base):
+    __tablename__ = "tokens"
+
+    token = Column(String, primary_key=True, index=True)
+    created_at = Column(DateTime, server_default=func.now())
+    
+
+Base.metadata.create_all(bind=engine)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# models---------------------------------------------------------------------------------------------------------------------------------------------
+class UserCreate(BaseModel):
+    username: str
+    email: str
+    password: str
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+def get_user(username: str):
+    if username in User:
+        user_dict = User[username] 
+        return User(**user_dict)
+
+class Token_a(BaseModel):
+    access_token: str
+    token_type: str
+
+# security----------------------------------------------------------------------------------------------------------------------------------------------
+JWT_SECRET_KEY = "mysecretkey"
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_TIME_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+# functions---------------------------------------------------------------------------------------------------------------------------------------------
+def get_db():
+    try:
+        db = SessionLocal()
+        yield db
+    finally:
+        db.close()
+
+def create_user(db: Session, user: UserCreate):
+    hashed_password = pwd_context.hash(user.password)
+    email = user .email
+    db_user = User(username=user.username,email = email, password_hash=hashed_password)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+def create_token(token_value: str, db: Session):
+    token = Token(token=token_value)
+    print(token)
+    db.add(token)
+    db.commit()
+    db.refresh(token)
+    return token
+
+def get_token(token_value: str, db: Session):
+    return db.query(Token).filter(Token.token == token_value).first()
+
+def delete_token(token_value: str):
+    db = SessionLocal()
+    token = get_token(token_value, db)
+    db.delete(token)
+    db.commit()
+
+
+def authenticate_user(db: Session, username: str, password: str):
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        return False
+    if not pwd_context.verify(password, user.password_hash):
+        return False
+    user.is_active= True
+    return user
+
+def decode_access_token(token: str):
+    try:
+        decoded_token = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        return decoded_token
+    except exceptions.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.exceptions.DecodeError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        return username
+    except PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentialsssss")
+    
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=JWT_EXPIRATION_TIME_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+# app-----------------------------------------------------------------------------------------------------------------------------------------
+app = FastAPI()
+
+@app.get("/")
+def home():
+    return "we are home"
+
+@app.get("/me")
+async def read_current_user(current_user: User = Depends(get_current_user)):
+    return {"current user:": current_user}
+
+@app.get("/home")
+def home(db :Session = Depends(get_db)):
+    user_token = db.query(Token).order_by(Token.created_at.desc()).first()
+    payload = jwt.decode(user_token.token, JWT_SECRET_KEY, algorithms=["HS256"])
+    subject = payload["sub"]
+    print(subject)
+    if not user_token:
+        return {"no users logged in" }
+    return {"CURRENT USER:": subject}
+
+@app.post("/signup")
+def sign_up(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.username == user.username).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    return create_user(db, user)
+
+@app.post("/login", response_model=Token_a)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    access_token = create_access_token(data={"sub": user.username})
+    token = create_token(token_value=access_token,db=db)
+    db.add(token)  
+    db.commit() 
+    db.refresh(token)
+
+    db.refresh(user)
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/logout")
+def logout(db: Session = Depends(get_db)):
+    user_token = db.query(Token).order_by(Token.created_at.desc()).first()
+    if not user_token:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="no tokens found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    db.delete(user_token)  
+    db.commit()            
+    return {"token": user_token.token, "created_at": user_token.created_at}
+
+
+@app.get("/protected")
+def protected(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+
+    return {"welcome home"},{"user": username}
